@@ -125,8 +125,8 @@ class RotaryPositionalEmbedding(nn.Module):
             t     = torch.arange(seq_len, device=device, dtype=dtype)
             freqs = torch.outer(t, self.inv_freq.to(dtype))
             emb   = torch.cat((freqs, freqs), dim=-1)
-            self._cos_cached = emb.cos()
-            self._sin_cached = emb.sin()
+            self._cos_cached = emb.cos().clone()
+            self._sin_cached = emb.sin().clone()
         return self._cos_cached, self._sin_cached
 
     def rotate_half(self, x):
