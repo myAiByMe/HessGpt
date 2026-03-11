@@ -70,7 +70,7 @@ CONFIG = {
     'use_flash_attn':        True,
 
     # ── Training
-    'batch_size':            30,
+    'batch_size':            32,
     'gradient_accumulation': 8,
     'max_grad_norm':         1.0,
     'learning_rate':         4e-4,
@@ -640,7 +640,7 @@ def configure_optimizers(model, lr, weight_decay, betas, eps):
         lr           = lr_muon,
         momentum     = 0.95,
         nesterov     = True,
-        ns_steps     = 5,
+        ns_steps     = 3,
         weight_decay = 0.0,
         use_mars     = True,
         mars_gamma   = 0.025,
