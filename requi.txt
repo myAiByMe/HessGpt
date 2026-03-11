@@ -1,0 +1,22 @@
+# HessGPT — Requirements
+# Python 3.10+  |  CUDA 12.1+  |  H100 SXM
+
+# ── Core ──────────────────────────────────────────────────────
+torch>=2.3.0                  # Flash Attention SDPA, fused AdamW, torch.compile
+torchvision>=0.18.0           # optionnel mais souvent tiré par torch
+
+# ── HuggingFace ───────────────────────────────────────────────
+transformers>=4.40.0          # AutoTokenizer, LLaMA-3 tokenizer
+datasets>=2.19.0              # load_dataset, streaming, filter, select
+huggingface-hub>=0.23.0       # téléchargement datasets HF
+
+# ── Tokenizer backend ─────────────────────────────────────────
+tokenizers>=0.19.0            # backend Rust pour AutoTokenizer rapide
+
+# ── Utilitaires training ──────────────────────────────────────
+tqdm>=4.66.0                  # barres de progression
+numpy>=1.26.0                 # mmap_mode, chunks .npy (pretrain)
+
+# ── Accélération optionnelle ──────────────────────────────────
+# flash-attn>=2.5.0           # si SDPA natif ne suffit pas (normalement inutile sur H100)
+# bitsandbytes>=0.43.0        # pour QLoRA uniquement (run QMARS)
