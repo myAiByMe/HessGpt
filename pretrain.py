@@ -85,7 +85,7 @@ CONFIG = {
     'save_every_steps':      2000,
     'checkpoint_file':       './Model/HessGpt_pretrain.pt',
     'use_compile':           True,
-    'compile_mode':          'reduce-overhead',  # ✅ v6
+    'compile_mode':          'default',  # ✅ v6
     'compile_cache':         './compile_cache',  # ✅ v6
 }
 
