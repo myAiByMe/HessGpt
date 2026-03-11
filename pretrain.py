@@ -625,6 +625,7 @@ def train_one_chunk(
 
     total_batches = total_seqs // CONFIG['batch_size']
     num_batches   = len(train_loader)
+    already_done  = max(total_batches - num_batches, 0)  # ✅ fix tqdm clamping
     print(f"  train={total_batches:,} batches | restant={num_batches:,} | val={len(val_loader):,}")
     print(f"  ✅ Zéro transfert PCIe — tout en VRAM")
 
@@ -645,7 +646,7 @@ def train_one_chunk(
     adt = torch.bfloat16 if ae else torch.float32
 
     pbar = tqdm(train_loader, desc=label, leave=True,
-                initial=total_batches - num_batches, total=total_batches)
+                initial=already_done, total=total_batches)
 
     for batch_idx, (x, y) in enumerate(pbar):
         try:
