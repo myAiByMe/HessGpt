@@ -1,22 +1,34 @@
 #!/usr/bin/env python3
 """
-HessGPT Pre-Training v6 — LLaMA-3 Tokenizer
-FIXES v6 (par rapport à v5) :
-  ✅ Dataset entièrement en VRAM — zéro transfert PCIe pendant le training
-  ✅ num_workers=0 — inutile quand les données sont déjà en VRAM
-  ✅ pin_memory=False — inutile quand les données sont déjà en VRAM
-  ✅ Prefetch du chunk suivant en background (threading) pendant le training
-  ✅ compile_cache persisté sur disk — évite les 25min de recompile au restart
-  ✅ ns_steps=3 hardcodé dans configure_optimizers (était 5 malgré défaut=3)
-  ✅ compile_mode='reduce-overhead' — optimisé boucles répétitives B200
+HessGPT Pre-Training v7 — LLaMA-3 Tokenizer
+BASE : v5 (RAM + persistent_workers + share_memory)
 
-FIXES v5 (conservés) :
+CHANGEMENTS v7 :
+  ✅ batch_size=48  max_seq_len=512
+     → 4x moins de compute attention (O(n²))
+     → tokens/batch identiques : 48×512 = 24,576 = 24×1024
+     → VRAM libérée, throughput plus élevé sur B200
+  ✅ yarn_original_max_len=512 aligné avec max_seq_len
+  ✅ compile_mode='default' — stable, pas de CUDA Graphs (bug RoPE cache)
+  ✅ compile_cache persisté → évite 25min de recompile au restart
+  ✅ tf32 flags — TensorCores B200 sur toutes les matmuls fp32 résiduelles
+  ✅ torch.set_float32_matmul_precision('high')
+  ✅ ns_steps=3 hardcodé dans configure_optimizers
+  ✅ fix tqdm clamping (max(...,0))
+
+CONSERVÉS de v5 :
   ✅ MARS-M intégré dans Muon
-  ✅ RMSNorm weights dans blocks → AdamW nodecay
-  ✅ WSD scheduler : tag is_muon
+  ✅ persistent_workers=True + share_memory()
+  ✅ mmap_mode='r' — pas de copie RAM double
+  ✅ RMSNorm weights → AdamW nodecay
+  ✅ WSD scheduler tag is_muon
   ✅ Shuffle seed variable par chunk
-  ✅ Sauvegarde atomique + JSON info
-  ✅ Reprise propre par chunk
+  ✅ Sauvegarde atomique + JSON + reprise propre
+
+STRATÉGIE SEQ_LEN :
+  Pretrain : 512 (ce script)
+  SFT      : 2048 via YaRN (use_yarn=True, yarn_scale=2.0)
+  Fallback  : epoch dédiée extension contexte (2B tokens, LR bas, seq=2048)
 """
 
 import torch
@@ -27,7 +39,6 @@ import time
 import math
 import json
 import gc
-import threading
 from tqdm import tqdm
 from transformers import AutoTokenizer
 from datetime import datetime
@@ -42,29 +53,32 @@ sys.path.append('./Core/TransformerBlock')
 SPECIAL_TOKENS = ['<code>', '<think>', '</think>']
 
 print("=" * 80)
-print("HessGPT v6 — LLaMA-3 | VRAM Dataset | Prefetch | Muon+MARS-M")
+print("HessGPT v7 — LLaMA-3 | batch=48 | seq=512 | tf32 | Muon+MARS-M")
 print("=" * 80)
 
 # ============================================================
 # CONFIGURATION
 # ============================================================
 CONFIG = {
+    # ── Modèle
     'vocab_size':            None,
     'embed_dim':             1280,
     'num_heads':             20,
     'num_layers':            24,
-    'max_seq_len':           1024,
+    'max_seq_len':           512,    # ✅ v7 : 4x moins d'attention compute vs 1024
     'dropout':               0.0,
     'use_rope':              True,
     'use_yarn':              False,
     'yarn_scale':            4.0,
-    'yarn_original_max_len': 1024,
+    'yarn_original_max_len': 512,    # ✅ v7 : aligné avec max_seq_len
     'use_swiglu':            True,
     'n_kv_heads':            5,
     'use_qk_norm':           True,
     'soft_cap':              30.0,
     'use_flash_attn':        True,
-    'batch_size':            24,
+
+    # ── Training
+    'batch_size':            48,     # ✅ v7 : 48×512 = 24,576 tokens/batch = 24×1024
     'gradient_accumulation': 8,
     'max_grad_norm':         1.0,
     'learning_rate':         4e-4,
@@ -72,33 +86,50 @@ CONFIG = {
     'adam_beta1':            0.9,
     'adam_beta2':            0.95,
     'adam_eps':              1e-8,
-    'num_epochs':            5,
-    'chunks_per_epoch':      3,
-    'data_dir':              './data/ultra_filtered',
-    'val_tokens':            15_000_000,
-    'warmup_ratio':          0.03,
-    'decay_ratio':           0.15,
-    'min_lr_ratio':          0.1,
-    'validate_every_steps':  500,
-    'val_batches':           50,
-    'shuffle_seed':          42,
-    'save_every_steps':      2000,
-    'checkpoint_file':       './Model/HessGpt_pretrain.pt',
-    'use_compile':           True,
-    'compile_mode':          'default',  # ✅ v6
-    'compile_cache':         './compile_cache',  # ✅ v6
+
+    # ── Epochs & Chunks
+    'num_epochs':       5,
+    'chunks_per_epoch': 3,
+
+    # ── Data
+    'data_dir':   './data/ultra_filtered',
+    'val_tokens': 15_000_000,
+
+    # ── WSD LR Schedule
+    'warmup_ratio': 0.03,
+    'decay_ratio':  0.15,
+    'min_lr_ratio': 0.1,
+
+    # ── Validation
+    'validate_every_steps': 500,
+    'val_batches':          50,
+
+    # ── Shuffle
+    'shuffle_seed': 42,
+
+    # ── Saves
+    'save_every_steps': 2000,
+
+    # ── Checkpoint
+    'checkpoint_file': './Model/HessGpt_pretrain.pt',
+
+    # ── System
+    'use_compile':   True,
+    'compile_mode':  'default',       # ✅ v7 : stable, pas de CUDA Graphs
+    'compile_cache': './compile_cache',
+    'num_workers':   8,
 }
 
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-# ✅ v6 : tf32 — TensorCores B200/H100 sur toutes les matmuls fp32 résiduelles
+# ✅ v7 : tf32 — TensorCores B200/H100 sur toutes les matmuls fp32 résiduelles
 if device == 'cuda':
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32       = True
     torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = True
-    torch.set_float32_matmul_precision('high')  # 'high'=tf32  'highest'=fp32 pur
+    torch.set_float32_matmul_precision('high')
 
-# ✅ v6 : cache compile persisté sur disk
+# ✅ v7 : cache compile persisté sur disk — évite 25min de recompile au restart
 if CONFIG['compile_cache']:
     os.environ['TORCHINDUCTOR_CACHE_DIR'] = CONFIG['compile_cache']
     os.makedirs(CONFIG['compile_cache'], exist_ok=True)
@@ -106,13 +137,16 @@ if CONFIG['compile_cache']:
 print(f"\nCONFIG :")
 print(f"  embed={CONFIG['embed_dim']}  layers={CONFIG['num_layers']}  "
       f"heads={CONFIG['num_heads']}  kv={CONFIG['n_kv_heads']}")
-print(f"  batch={CONFIG['batch_size']}  accum={CONFIG['gradient_accumulation']}  "
-      f"device={device}")
+print(f"  epochs={CONFIG['num_epochs']}  chunks/epoch={CONFIG['chunks_per_epoch']}")
+print(f"  batch={CONFIG['batch_size']}  seq={CONFIG['max_seq_len']}  "
+      f"accum={CONFIG['gradient_accumulation']}  device={device}")
+print(f"  tokens/batch = {CONFIG['batch_size']}×{CONFIG['max_seq_len']} "
+      f"= {CONFIG['batch_size']*CONFIG['max_seq_len']:,}  (= 24×1024 ✅)")
 print(f"  compile_mode={CONFIG['compile_mode']}  cache={CONFIG['compile_cache']}")
-print(f"  ✅ Dataset VRAM — zéro transfert PCIe pendant training")
 if device == 'cuda':
     print(f"  GPU={torch.cuda.get_device_name(0)}  "
           f"VRAM={torch.cuda.get_device_properties(0).total_memory/1e9:.0f}GB")
+    print(f"  tf32=ON  bf16_reduction=ON  matmul_precision=high")
 
 # ============================================================
 # SCAN CHUNKS
@@ -129,13 +163,15 @@ def scan_available_chunks(data_dir):
         if not os.path.isdir(chunk_dir) or not os.path.exists(stats_file):
             continue
         try:
-            with open(stats_file) as f:
+            with open(stats_file, 'r') as f:
                 stats = json.load(f)
             npy_files = sorted([f for f in os.listdir(chunk_dir) if f.endswith('.npy')])
             if not npy_files:
                 continue
             cid = int(entry.split('_')[1]) if '_' in entry else int(entry.replace('chunk', ''))
-            available.append({'id': cid, 'dir': chunk_dir, 'files': npy_files, 'stats': stats})
+            available.append({
+                'id': cid, 'dir': chunk_dir, 'files': npy_files, 'stats': stats,
+            })
         except Exception as e:
             print(f"  skip {entry}: {e}")
     available.sort(key=lambda x: x['id'])
@@ -155,25 +191,33 @@ if epochs_possible == 0:
     print(f"  ERREUR: {n_chunks} chunks < chunks_per_epoch={CONFIG['chunks_per_epoch']}")
     sys.exit(1)
 if epochs_possible < CONFIG['num_epochs']:
-    print(f"  WARN: seulement {epochs_possible} epochs possibles")
+    print(f"  WARN: seulement {epochs_possible} epochs possibles avec {n_chunks} chunks")
     CONFIG['num_epochs'] = epochs_possible
 
 TOTAL_CHUNKS_USED = CONFIG['num_epochs'] * CONFIG['chunks_per_epoch']
 ALL_TRAIN_CHUNKS  = ALL_CHUNKS[:TOTAL_CHUNKS_USED]
 
-print(f"\nPLAN CHUNKS :")
+print(f"\nPLAN CHUNKS (sliding window, jamais recyclés) :")
 for ep in range(CONFIG['num_epochs']):
     s   = ep * CONFIG['chunks_per_epoch']
     ids = [f"chunk_{c['id']:03d}" for c in ALL_TRAIN_CHUNKS[s:s + CONFIG['chunks_per_epoch']]]
     print(f"  Epoch {ep+1:2d} : {' '.join(ids)}")
 
+# ============================================================
+# CALCUL STEPS
+# ============================================================
 def steps_for_chunk(stats):
+    # seq=512 → 2x plus de séquences par chunk vs seq=1024
     samples = stats['total_tokens'] // (CONFIG['max_seq_len'] + 1)
     batches = math.ceil(samples / CONFIG['batch_size'])
     return max(math.ceil(batches / CONFIG['gradient_accumulation']), 1)
 
-TOTAL_STEPS = sum(steps_for_chunk(c['stats']) for c in ALL_TRAIN_CHUNKS)
-print(f"\nPLAN STEPS : total={TOTAL_STEPS:,}  save every {CONFIG['save_every_steps']} steps")
+TOTAL_STEPS     = sum(steps_for_chunk(c['stats']) for c in ALL_TRAIN_CHUNKS)
+STEPS_PER_EPOCH = TOTAL_STEPS // max(CONFIG['num_epochs'], 1)
+
+print(f"\nPLAN STEPS :")
+print(f"  steps/epoch~={STEPS_PER_EPOCH:,}  total={TOTAL_STEPS:,}")
+print(f"  save every {CONFIG['save_every_steps']} steps + après chaque chunk")
 
 # ============================================================
 # TOKENIZER
@@ -185,6 +229,8 @@ if tokenizer.pad_token is None:
     tokenizer.pad_token = tokenizer.eos_token
 CONFIG['vocab_size'] = len(tokenizer)
 print(f"  vocab={len(tokenizer)}")
+for tok in SPECIAL_TOKENS:
+    print(f"  {tok} → {tokenizer.convert_tokens_to_ids(tok)}")
 
 # ============================================================
 # WSD SCHEDULER
@@ -234,18 +280,14 @@ class WSDScheduler:
         self.current_step = sd['current_step']
 
 # ============================================================
-# DATASET EN VRAM
+# DATASET — RAM + shared memory (v5)
 # ============================================================
-class VRAMDataset(Dataset):
-    """
-    ✅ v6 : Tokens directement en VRAM.
-    __getitem__ retourne des slices déjà sur GPU — zéro copie, zéro PCIe.
-    Requiert num_workers=0 (pas de fork avec tenseurs CUDA).
-    """
-    def __init__(self, tokens_cuda: torch.Tensor, seq_len: int):
-        self.seq_len     = seq_len
-        self.num_samples = len(tokens_cuda) // (seq_len + 1)
-        self.tokens      = tokens_cuda[:self.num_samples * (seq_len + 1)]
+class ChunkSubset(Dataset):
+    def __init__(self, tokens, seq_len, pad_token_id):
+        self.seq_len      = seq_len
+        self.pad_token_id = pad_token_id
+        self.num_samples  = len(tokens) // (seq_len + 1)
+        self.tokens       = tokens[:self.num_samples * (seq_len + 1)].share_memory_()
 
     def __len__(self):
         return self.num_samples
@@ -253,18 +295,19 @@ class VRAMDataset(Dataset):
     def __getitem__(self, idx):
         start = idx * (self.seq_len + 1)
         chunk = self.tokens[start:start + self.seq_len + 1]
-        return chunk[:-1], chunk[1:]
+        return chunk[:-1].clone(), chunk[1:].clone()
 
 
 class SeededSampler(torch.utils.data.Sampler):
     def __init__(self, n: int, seed: int, skip_samples: int = 0):
-        self.n        = n
-        rng           = np.random.default_rng(seed)
-        indices       = rng.permutation(n)
-        skip          = min(skip_samples, n)
-        self._indices = indices[skip:]
+        self.n            = n
+        self.seed         = seed
+        self.skip_samples = min(skip_samples, n)
+        rng               = np.random.default_rng(seed)
+        indices           = rng.permutation(n)
+        self._indices     = indices[self.skip_samples:]
         print(f"  SeededSampler : n={n:,}  seed={seed}  "
-              f"skip={skip:,}  restant={len(self._indices):,}")
+              f"skip={self.skip_samples:,}  restant={len(self._indices):,}")
 
     def __iter__(self):
         return iter(self._indices.tolist())
@@ -273,18 +316,17 @@ class SeededSampler(torch.utils.data.Sampler):
         return len(self._indices)
 
 
-class VRAMChunkLoader:
-    """
-    ✅ v6 : Charge chunk disk → RAM → VRAM en une passe.
-    Shuffle fait en RAM avant transfert pour ne pas fragmenter la VRAM.
-    """
+class LazyChunkDataset:
     def __init__(self, chunk_info, seq_len, pad_token_id,
                  val_tokens=15_000_000, val_seed=0):
-        self.seq_len = seq_len
-        self._load(chunk_info, val_tokens, val_seed)
+        self.seq_len      = seq_len
+        self.pad_token_id = pad_token_id
+        self.val_tokens   = val_tokens
+        self.val_seed     = val_seed
+        self._load(chunk_info)
 
-    def _load(self, chunk_info, val_tokens, val_seed):
-        print(f"  Loading chunk_{chunk_info['id']:03d} → VRAM...")
+    def _load(self, chunk_info):
+        print(f"  Loading chunk_{chunk_info['id']:03d}...")
         t0 = time.time()
 
         arrays = []
@@ -302,84 +344,37 @@ class VRAMChunkLoader:
         all_tokens = torch.cat(arrays)
         total      = len(all_tokens)
 
-        # Shuffle en RAM
         seq_len_1  = self.seq_len + 1
         n_seqs     = total // seq_len_1
-        rng        = np.random.default_rng(val_seed)
+        rng        = np.random.default_rng(self.val_seed)
         idx        = rng.permutation(n_seqs)
         all_tokens = all_tokens[:n_seqs * seq_len_1].reshape(n_seqs, seq_len_1)[idx].reshape(-1)
         total      = len(all_tokens)
 
-        val_size   = min(val_tokens, int(total * 0.05))
+        val_size   = min(self.val_tokens, int(total * 0.05))
         train_size = total - val_size
 
-        vram_gb = all_tokens.element_size() * total / 1e9
+        self._train_toks = all_tokens[:train_size]
+        self._val_toks   = all_tokens[train_size:]
+
+        ram_gb = all_tokens.element_size() * total / 1e9
         print(f"  chunk_{chunk_info['id']:03d} : {total/1e6:.0f}M tokens  "
               f"train={train_size/1e6:.0f}M  val={val_size/1e6:.0f}M  "
-              f"VRAM={vram_gb:.1f}GB  ({time.time()-t0:.1f}s)")
-
-        # Transfert unique RAM → VRAM
-        self._train_toks = all_tokens[:train_size].to(device, non_blocking=True)
-        self._val_toks   = all_tokens[train_size:].to(device, non_blocking=True)
-        torch.cuda.synchronize()
-
-        del all_tokens
-        gc.collect()
+              f"n_seqs={n_seqs:,} (seq={self.seq_len})  "
+              f"RAM={ram_gb:.1f}GB  ({time.time()-t0:.1f}s)  val_seed={self.val_seed}")
 
     def get_train_dataset(self):
-        return VRAMDataset(self._train_toks, self.seq_len)
+        return ChunkSubset(self._train_toks, self.seq_len, self.pad_token_id)
 
     def get_val_dataset(self):
-        return VRAMDataset(self._val_toks, self.seq_len)
+        return ChunkSubset(self._val_toks, self.seq_len, self.pad_token_id)
 
     def unload(self):
         del self._train_toks, self._val_toks
         gc.collect()
-        torch.cuda.empty_cache()
-        print(f"  VRAM chunk libérée")
-
-
-# ============================================================
-# PREFETCHER — charge le chunk suivant en background
-# ============================================================
-class ChunkPrefetcher:
-    """
-    ✅ v6 : Thread daemon qui charge le chunk N+1 pendant que N s'entraîne.
-    Le transfert PCIe se fait en overlap avec le compute GPU.
-    """
-    def __init__(self):
-        self._next   = None
-        self._thread = None
-        self._error  = None
-
-    def prefetch(self, chunk_info, seq_len, pad_token_id, val_tokens, val_seed):
-        def _load():
-            try:
-                self._next = VRAMChunkLoader(chunk_info, seq_len, pad_token_id,
-                                             val_tokens, val_seed)
-            except Exception as e:
-                self._error = e
-        self._next   = None
-        self._error  = None
-        self._thread = threading.Thread(target=_load, daemon=True)
-        self._thread.start()
-
-    def get(self):
-        if self._thread is not None:
-            self._thread.join()
-            self._thread = None
-        if self._error is not None:
-            raise self._error
-        return self._next
-
-    def cancel(self):
-        if self._thread is not None:
-            self._thread.join()
-            self._thread = None
-        if self._next is not None:
-            self._next.unload()
-            self._next = None
-
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        print(f"  RAM chunk libérée")
 
 # ============================================================
 # CHECKPOINT MANAGER
@@ -400,8 +395,11 @@ class CheckpointManager:
         else:
             opt_state = {'optimizer_state_dict': optimizers.state_dict()}
 
-        cp = {**opt_state, 'model_state_dict': m.state_dict(),
-              'scheduler_state_dict': scheduler.state_dict()}
+        cp = {
+            **opt_state,
+            'model_state_dict':     m.state_dict(),
+            'scheduler_state_dict': scheduler.state_dict(),
+        }
         tmp = self.path + '.tmp'
         torch.save(cp, tmp)
         os.replace(tmp, self.path)
@@ -422,7 +420,9 @@ class CheckpointManager:
 
         print(f"  💾 SAVE → epoch={metadata['current_epoch']}  "
               f"cwi={metadata['chunk_within_epoch']}/{CONFIG['chunks_per_epoch']}  "
-              f"step={metadata['global_step']:,}  [{self.path}]")
+              f"step={metadata['global_step']:,}  "
+              f"chunk_start={metadata.get('chunk_start_step',0):,}  "
+              f"[{self.path}]")
 
     def load(self):
         if not os.path.exists(self.path):
@@ -431,7 +431,7 @@ class CheckpointManager:
         cp = torch.load(self.path, map_location='cpu', weights_only=False)
         json_path = self.path.replace('.pt', '_info.json')
         if os.path.exists(json_path):
-            with open(json_path) as f:
+            with open(json_path, 'r') as f:
                 info = json.load(f)
             cp['global_step']         = info.get('global_step', 0)
             cp['chunk_start_step']    = info.get('chunk_start_step', 0)
@@ -441,10 +441,14 @@ class CheckpointManager:
             cp['training_history']    = info.get('training_history',
                                          {'chunks': [], 'validations': [], 'epochs': []})
             cp['last_save']           = info.get('last_save', '?')
-            print(f"  [JSON] epoch={cp['current_epoch']}  cwi={cp['chunk_within_epoch']}  "
-                  f"step={cp['global_step']:,}  saved={cp['last_save']}")
+            print(f"  [JSON] epoch={cp['current_epoch']}  "
+                  f"cwi={cp['chunk_within_epoch']}  "
+                  f"step={cp['global_step']:,}  "
+                  f"chunk_start={cp['chunk_start_step']:,}  "
+                  f"saved={cp['last_save']}")
+        else:
+            print(f"  [PT fallback] step={cp.get('global_step',0):,}")
         return cp
-
 
 # ============================================================
 # VALIDATION
@@ -459,7 +463,7 @@ def validate(model, val_loader, max_batches=50):
         for i, (x, y) in enumerate(val_loader):
             if i >= max_batches:
                 break
-            # x, y déjà en VRAM
+            x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
             with torch.amp.autocast(device, dtype=adt, enabled=ae):
                 _, loss, _ = model(x, targets=y, pad_token_id=tokenizer.pad_token_id)
             total_loss += loss.item()
@@ -468,7 +472,6 @@ def validate(model, val_loader, max_batches=50):
         model.train()
     avg = total_loss / max(n, 1)
     return math.exp(min(avg, 10)), avg
-
 
 # ============================================================
 # MUON + MARS-M
@@ -489,7 +492,7 @@ def zeropower_via_newtonschulz5(G: torch.Tensor, steps: int = 3) -> torch.Tensor
 
 
 class Muon(torch.optim.Optimizer):
-    """Muon + MARS-M — identique pretrain v5, ns_steps=3 par défaut."""
+    """Muon + MARS-M — ns_steps=3 par défaut."""
     def __init__(self, params, lr=0.02, momentum=0.95,
                  nesterov=True, ns_steps=3, weight_decay=0.0,
                  use_mars=True, mars_gamma=0.025):
@@ -518,11 +521,11 @@ class Muon(torch.optim.Optimizer):
                 if use_mars:
                     if 'prev_grad' not in state:
                         state['prev_grad'] = torch.zeros_like(g)
-                    prev_g    = state['prev_grad']
-                    c_t       = (mars_gamma / (1.0 - mars_gamma)) * (
-                                 (g.norm() + 1e-8) / (prev_g.norm() + 1e-8))
-                    c_t       = torch.clamp(c_t, max=1.0)
-                    g         = g + c_t * (g - prev_g)
+                    prev_g = state['prev_grad']
+                    c_t    = (mars_gamma / (1.0 - mars_gamma)) * (
+                              (g.norm() + 1e-8) / (prev_g.norm() + 1e-8))
+                    c_t    = torch.clamp(c_t, max=1.0)
+                    g      = g + c_t * (g - prev_g)
                     state['prev_grad'].copy_(p.grad)
 
                 if 'momentum_buffer' not in state:
@@ -540,8 +543,11 @@ class Muon(torch.optim.Optimizer):
 
 
 def configure_optimizers(model, lr, weight_decay, betas, eps):
-    MUON_EXCLUDE = {'token_embeddings.weight', 'output_head.weight',
-                    'position_embeddings.weight'}
+    MUON_EXCLUDE = {
+        'token_embeddings.weight',
+        'output_head.weight',
+        'position_embeddings.weight',
+    }
     muon_params, adamw_decay, adamw_nodecay = [], [], []
 
     for pn, p in model.named_parameters():
@@ -552,7 +558,7 @@ def configure_optimizers(model, lr, weight_decay, betas, eps):
         elif p.dim() >= 2 and pn.startswith('blocks.'):
             muon_params.append(p)
         elif p.dim() < 2 and pn.startswith('blocks.'):
-            adamw_nodecay.append(p)
+            adamw_nodecay.append(p)   # ✅ RMSNorm weights
         elif p.dim() >= 2:
             adamw_decay.append(p)
         else:
@@ -562,14 +568,16 @@ def configure_optimizers(model, lr, weight_decay, betas, eps):
     muon_opt = Muon(
         [{'params': muon_params, 'is_muon': True}],
         lr=lr_muon, momentum=0.95, nesterov=True,
-        ns_steps=3,               # ✅ v6 : 3 hardcodé
+        ns_steps=3,           # ✅ v7 : 3 hardcodé
         weight_decay=0.0, use_mars=True, mars_gamma=0.025,
     )
     muon_opt.param_groups[0]['is_muon'] = True
 
     adamw_opt = torch.optim.AdamW(
-        [{'params': adamw_decay,   'weight_decay': weight_decay, 'is_muon': False},
-         {'params': adamw_nodecay, 'weight_decay': 0.0,          'is_muon': False}],
+        [
+            {'params': adamw_decay,   'weight_decay': weight_decay, 'is_muon': False},
+            {'params': adamw_nodecay, 'weight_decay': 0.0,          'is_muon': False},
+        ],
         lr=lr, betas=betas, eps=eps, fused=(device == 'cuda'),
     )
 
@@ -580,62 +588,80 @@ def configure_optimizers(model, lr, weight_decay, betas, eps):
           f"{len(adamw_nodecay):3d} no-decay  lr={lr:.2e}")
     return muon_opt, adamw_opt
 
-
 # ============================================================
 # TRAIN ONE CHUNK
 # ============================================================
 def train_one_chunk(
-    model, cds, chunk_id,
+    model, chunk_info,
     optimizers, scheduler,
     checkpoint_manager, training_history,
     global_step, total_training_time,
-    current_epoch, chunk_within_epoch, chunk_start_step,
-    prefetcher, next_chunk_info,
+    current_epoch, chunk_within_epoch,
+    chunk_start_step,
 ):
     muon_opt, adamw_opt = optimizers
     label        = (f"Epoch {current_epoch}/{CONFIG['num_epochs']} | "
                     f"cwi {chunk_within_epoch+1}/{CONFIG['chunks_per_epoch']} "
-                    f"(chunk_{chunk_id:03d})")
+                    f"(chunk_{chunk_info['id']:03d})")
     steps_done   = global_step - chunk_start_step
     batches_done = steps_done * CONFIG['gradient_accumulation']
     shuffle_seed = CONFIG['shuffle_seed'] + (current_epoch - 1) * 1000 + chunk_within_epoch
 
     print(f"\n{'='*80}")
     print(f"  {label}  LR_adamw={scheduler.get_last_lr()[0]:.2e}"
-          f"  LR_muon={scheduler.get_last_lr()[0]*5:.2e}")
+          f"  LR_muon={scheduler.get_last_lr()[0]*5:.2e}  shuffle_seed={shuffle_seed}")
     if batches_done > 0:
-        print(f"  ⏩ Reprise : steps_done={steps_done:,}  batches_done={batches_done:,}")
+        print(f"  ⏩ Reprise : global_step={global_step:,}  "
+              f"steps_done={steps_done:,}  batches_done={batches_done:,}")
     print(f"{'='*80}")
+
+    try:
+        cds = LazyChunkDataset(
+            chunk_info, CONFIG['max_seq_len'],
+            tokenizer.pad_token_id, CONFIG['val_tokens'],
+            val_seed=shuffle_seed,
+        )
+    except Exception as e:
+        print(f"  ERREUR chargement chunk : {e}")
+        return global_step, total_training_time, chunk_start_step
 
     train_ds   = cds.get_train_dataset()
     total_seqs = len(train_ds)
 
     if batches_done >= math.ceil(total_seqs / CONFIG['batch_size']):
-        print(f"  ✅ Chunk déjà traité, skip.")
+        print(f"  ✅ Chunk déjà entièrement traité, skip.")
+        cds.unload()
+        gc.collect()
         return global_step, total_training_time, chunk_start_step
 
-    sampler = SeededSampler(total_seqs, shuffle_seed,
-                            skip_samples=batches_done * CONFIG['batch_size'])
+    sampler = SeededSampler(
+        n=total_seqs, seed=shuffle_seed,
+        skip_samples=batches_done * CONFIG['batch_size'],
+    )
 
-    # ✅ v6 : num_workers=0, pin_memory=False — données déjà en VRAM
-    train_loader = DataLoader(train_ds, batch_size=CONFIG['batch_size'],
-                              sampler=sampler, num_workers=0, pin_memory=False)
-    val_loader   = DataLoader(cds.get_val_dataset(), batch_size=CONFIG['batch_size'],
-                              shuffle=False, num_workers=0, pin_memory=False)
+    train_loader = DataLoader(
+        train_ds,
+        batch_size         = CONFIG['batch_size'],
+        sampler            = sampler,
+        num_workers        = CONFIG['num_workers'],
+        pin_memory         = True,
+        persistent_workers = True,
+        prefetch_factor    = 2,
+        drop_last          = True,
+    )
+    val_loader = DataLoader(
+        cds.get_val_dataset(),
+        batch_size         = CONFIG['batch_size'],
+        shuffle            = False,
+        num_workers        = 2,
+        pin_memory         = True,
+        persistent_workers = True,
+    )
 
-    total_batches = total_seqs // CONFIG['batch_size']
     num_batches   = len(train_loader)
+    total_batches = total_seqs // CONFIG['batch_size']
     already_done  = max(total_batches - num_batches, 0)  # ✅ fix tqdm clamping
     print(f"  train={total_batches:,} batches | restant={num_batches:,} | val={len(val_loader):,}")
-    print(f"  ✅ Zéro transfert PCIe — tout en VRAM")
-
-    # ✅ Lancer prefetch du chunk suivant dès que le training démarre
-    if next_chunk_info is not None and prefetcher is not None:
-        next_val_seed = (CONFIG['shuffle_seed'] + (current_epoch - 1) * 1000
-                         + chunk_within_epoch + 1)
-        print(f"  🔄 Prefetch chunk_{next_chunk_info['id']:03d} en background...")
-        prefetcher.prefetch(next_chunk_info, CONFIG['max_seq_len'],
-                            tokenizer.pad_token_id, CONFIG['val_tokens'], next_val_seed)
 
     model.train()
     chunk_loss, valid_batches     = 0.0, 0
@@ -650,7 +676,8 @@ def train_one_chunk(
 
     for batch_idx, (x, y) in enumerate(pbar):
         try:
-            # ✅ x, y déjà en VRAM — pas de .to(device)
+            x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
+
             with torch.amp.autocast(device, dtype=adt, enabled=ae):
                 _, loss, _ = model(x, targets=y, pad_token_id=tokenizer.pad_token_id)
                 loss = loss / CONFIG['gradient_accumulation']
@@ -683,21 +710,25 @@ def train_one_chunk(
                           f"val={val_loss:.4f} ppl={val_ppl:.1f} | "
                           f"lr={scheduler.get_last_lr()[0]:.2e}\n")
                     training_history['validations'].append({
-                        'step': global_step, 'current_epoch': current_epoch,
-                        'chunk_within_epoch': chunk_within_epoch, 'chunk_id': chunk_id,
-                        'val_loss': val_loss, 'val_ppl': val_ppl,
-                        'train_loss': avg, 'lr': scheduler.get_last_lr()[0],
+                        'step':               global_step,
+                        'current_epoch':      current_epoch,
+                        'chunk_within_epoch': chunk_within_epoch,
+                        'chunk_id':           chunk_info['id'],
+                        'val_loss':           val_loss,
+                        'val_ppl':            val_ppl,
+                        'train_loss':         avg,
+                        'lr':                 scheduler.get_last_lr()[0],
                     })
                     running_loss, running_batches = 0.0, 0
 
                 if global_step % CONFIG['save_every_steps'] == 0:
                     checkpoint_manager.save(model, optimizers, scheduler, metadata={
-                        'current_epoch': current_epoch,
-                        'chunk_within_epoch': chunk_within_epoch,
-                        'global_step': global_step,
-                        'chunk_start_step': chunk_start_step,
+                        'current_epoch':       current_epoch,
+                        'chunk_within_epoch':  chunk_within_epoch,
+                        'global_step':         global_step,
+                        'chunk_start_step':    chunk_start_step,
                         'total_training_time': total_training_time + (time.time() - t_start),
-                        'training_history': training_history,
+                        'training_history':    training_history,
                     })
 
             raw = loss.item() * CONFIG['gradient_accumulation']
@@ -708,10 +739,13 @@ def train_one_chunk(
 
             if batch_idx % 20 == 0:
                 avg = running_loss / max(running_batches, 1)
-                pbar.set_postfix(loss=f'{raw:.4f}', avg=f'{avg:.4f}',
-                                 ppl=f'{math.exp(min(avg,10)):.1f}',
-                                 lr=f'{scheduler.get_last_lr()[0]:.2e}',
-                                 step=f'{global_step:,}')
+                pbar.set_postfix(
+                    loss=f'{raw:.4f}',
+                    avg=f'{avg:.4f}',
+                    ppl=f'{math.exp(min(avg,10)):.1f}',
+                    lr=f'{scheduler.get_last_lr()[0]:.2e}',
+                    step=f'{global_step:,}',
+                )
 
         except RuntimeError as e:
             if 'out of memory' in str(e).lower():
@@ -726,19 +760,35 @@ def train_one_chunk(
             raise
 
     pbar.close()
+
+    train_loader._iterator = None
+    del train_loader
+
     elapsed = time.time() - t_start
     total_training_time += elapsed
     avg_loss = chunk_loss / max(valid_batches, 1)
-    print(f"\n  chunk_{chunk_id:03d} terminé | loss={avg_loss:.4f} | {elapsed/60:.1f}min")
+    print(f"\n  chunk_{chunk_info['id']:03d} terminé | "
+          f"loss={avg_loss:.4f} | {elapsed/60:.1f}min")
 
     training_history['chunks'].append({
-        'current_epoch': current_epoch, 'chunk_within_epoch': chunk_within_epoch,
-        'chunk_id': chunk_id, 'train_loss': avg_loss,
-        'time_sec': elapsed, 'batches': valid_batches, 'global_step': global_step,
+        'current_epoch':      current_epoch,
+        'chunk_within_epoch': chunk_within_epoch,
+        'chunk_id':           chunk_info['id'],
+        'train_loss':         avg_loss,
+        'time_sec':           elapsed,
+        'batches':            valid_batches,
+        'global_step':        global_step,
     })
 
-    return global_step, total_training_time, chunk_start_step
+    val_loader._iterator = None
+    del val_loader
+    cds.unload()
+    del cds
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
+    return global_step, total_training_time, chunk_start_step
 
 # ============================================================
 # MAIN
@@ -748,19 +798,24 @@ def main():
 
     print('\n' + '='*80 + '\nCREATION MODELE\n' + '='*80)
 
-    ckpt_mgr   = CheckpointManager(CONFIG['checkpoint_file'])
-    prefetcher = ChunkPrefetcher()
+    ckpt_mgr = CheckpointManager(CONFIG['checkpoint_file'])
 
     model = HessGPT(
-        vocab_size=CONFIG['vocab_size'], embed_dim=CONFIG['embed_dim'],
-        num_heads=CONFIG['num_heads'], num_layers=CONFIG['num_layers'],
-        max_seq_len=CONFIG['max_seq_len'], dropout=CONFIG['dropout'],
-        use_rope=CONFIG['use_rope'], use_yarn=CONFIG['use_yarn'],
-        yarn_scale=CONFIG['yarn_scale'],
-        yarn_original_max_len=CONFIG['yarn_original_max_len'],
-        use_swiglu=CONFIG['use_swiglu'], n_kv_heads=CONFIG['n_kv_heads'],
-        use_qk_norm=CONFIG['use_qk_norm'], soft_cap=CONFIG['soft_cap'],
-        use_flash_attn=CONFIG['use_flash_attn'],
+        vocab_size            = CONFIG['vocab_size'],
+        embed_dim             = CONFIG['embed_dim'],
+        num_heads             = CONFIG['num_heads'],
+        num_layers            = CONFIG['num_layers'],
+        max_seq_len           = CONFIG['max_seq_len'],
+        dropout               = CONFIG['dropout'],
+        use_rope              = CONFIG['use_rope'],
+        use_yarn              = CONFIG['use_yarn'],
+        yarn_scale            = CONFIG['yarn_scale'],
+        yarn_original_max_len = CONFIG['yarn_original_max_len'],
+        use_swiglu            = CONFIG['use_swiglu'],
+        n_kv_heads            = CONFIG['n_kv_heads'],
+        use_qk_norm           = CONFIG['use_qk_norm'],
+        soft_cap              = CONFIG['soft_cap'],
+        use_flash_attn        = CONFIG['use_flash_attn'],
     ).to(device)
 
     total_params = sum(p.numel() for p in model.parameters())
@@ -772,31 +827,42 @@ def main():
             model = torch.compile(model, mode=CONFIG['compile_mode'])
             print('  OK')
         except Exception as e:
-            print(f'  FAIL : {e}')
+            print(f'  FAIL (on continue sans) : {e}')
 
     raw_model  = model._orig_mod if hasattr(model, '_orig_mod') else model
     optimizers = configure_optimizers(
-        raw_model, CONFIG['learning_rate'], CONFIG['weight_decay'],
-        (CONFIG['adam_beta1'], CONFIG['adam_beta2']), CONFIG['adam_eps'],
+        raw_model,
+        CONFIG['learning_rate'],
+        CONFIG['weight_decay'],
+        (CONFIG['adam_beta1'], CONFIG['adam_beta2']),
+        CONFIG['adam_eps'],
     )
     muon_opt, adamw_opt = optimizers
 
     scheduler = WSDScheduler(
-        list(optimizers), max_lr=CONFIG['learning_rate'],
-        total_steps=TOTAL_STEPS, warmup_ratio=CONFIG['warmup_ratio'],
-        decay_ratio=CONFIG['decay_ratio'], min_lr_ratio=CONFIG['min_lr_ratio'],
+        list(optimizers),
+        max_lr       = CONFIG['learning_rate'],
+        total_steps  = TOTAL_STEPS,
+        warmup_ratio = CONFIG['warmup_ratio'],
+        decay_ratio  = CONFIG['decay_ratio'],
+        min_lr_ratio = CONFIG['min_lr_ratio'],
     )
 
     training_history = {
-        'config': CONFIG, 'total_params': total_params, 'total_steps': TOTAL_STEPS,
-        'chunks': [], 'validations': [], 'epochs': [],
-        'start_time': datetime.now().isoformat(),
+        'config':       CONFIG,
+        'total_params': total_params,
+        'total_steps':  TOTAL_STEPS,
+        'chunks':       [],
+        'validations':  [],
+        'epochs':       [],
+        'start_time':   datetime.now().isoformat(),
     }
 
-    global_step, current_epoch    = 0, 1
-    chunk_within_epoch             = 0
-    total_training_time            = 0.0
-    chunk_start_step               = 0
+    global_step         = 0
+    current_epoch       = 1
+    chunk_within_epoch  = 0
+    total_training_time = 0.0
+    chunk_start_step    = 0
 
     cp = ckpt_mgr.load()
     if cp:
@@ -824,19 +890,22 @@ def main():
         total_training_time = cp.get('total_training_time', 0.0)
         training_history    = cp.get('training_history', training_history)
 
-        steps_in_chunk = global_step - chunk_start_step
         print(f'  -> epoch={current_epoch}  cwi={chunk_within_epoch}  '
-              f'step={global_step:,}  '
-              f'steps_done_in_chunk={steps_in_chunk:,}')
+              f'step={global_step:,}  chunk_start_step={chunk_start_step:,}')
+        steps_in_chunk = global_step - chunk_start_step
+        print(f'  -> steps_done_in_chunk={steps_in_chunk:,}  '
+              f'(≈ {steps_in_chunk * CONFIG["gradient_accumulation"]:,} batches à skipper)')
 
         if current_epoch > CONFIG['num_epochs']:
             print(f'\n✅ Training terminé.')
             return
 
     print('\n' + '='*80)
-    print(f'TRAINING START — epochs {current_epoch}→{CONFIG["num_epochs"]}  '
-          f'chunks/epoch={CONFIG["chunks_per_epoch"]}  sliding window')
-    print(f'✅ Dataset VRAM + prefetch background')
+    print(f'TRAINING START')
+    print(f'  epochs {current_epoch}→{CONFIG["num_epochs"]}  |  '
+          f'chunks/epoch={CONFIG["chunks_per_epoch"]}  |  sliding window')
+    print(f'  batch={CONFIG["batch_size"]}  seq={CONFIG["max_seq_len"]}  '
+          f'tokens/batch={CONFIG["batch_size"]*CONFIG["max_seq_len"]:,}')
     print('='*80)
 
     for epoch in range(current_epoch, CONFIG['num_epochs'] + 1):
@@ -845,99 +914,83 @@ def main():
         start_cwi = chunk_within_epoch if epoch == current_epoch else 0
 
         chunk_ids_str = ' '.join(f'chunk_{c["id"]:03d}' for c in ep_chunks)
-        print(f'\nEPOCH {epoch}/{CONFIG["num_epochs"]} — {chunk_ids_str}')
-
-        # Charger le premier chunk directement
-        first_chunk    = ep_chunks[start_cwi]
-        first_val_seed = CONFIG['shuffle_seed'] + (epoch - 1) * 1000 + start_cwi
-        cds = VRAMChunkLoader(first_chunk, CONFIG['max_seq_len'],
-                              tokenizer.pad_token_id, CONFIG['val_tokens'],
-                              val_seed=first_val_seed)
+        print(f'\nEPOCH {epoch}/{CONFIG["num_epochs"]} — chunks : {chunk_ids_str}')
+        if start_cwi > 0:
+            print(f'  (reprise à cwi={start_cwi}  chunk_start_step={chunk_start_step:,})')
 
         for cwi in range(start_cwi, CONFIG['chunks_per_epoch']):
             chunk_info = ep_chunks[cwi]
 
-            is_resume = (epoch == current_epoch and cwi == chunk_within_epoch and cp is not None)
-            if not is_resume:
+            is_resume_chunk = (
+                epoch == current_epoch and
+                cwi   == chunk_within_epoch and
+                cp    is not None
+            )
+            if not is_resume_chunk:
                 chunk_start_step = global_step
-
-            # Déterminer le chunk suivant pour prefetch
-            if cwi + 1 < CONFIG['chunks_per_epoch']:
-                next_chunk_info = ep_chunks[cwi + 1]
-            elif epoch + 1 <= CONFIG['num_epochs']:
-                next_ep_start   = epoch * CONFIG['chunks_per_epoch']
-                next_chunk_info = (ALL_TRAIN_CHUNKS[next_ep_start]
-                                   if next_ep_start < len(ALL_TRAIN_CHUNKS) else None)
-            else:
-                next_chunk_info = None
 
             try:
                 global_step, total_training_time, chunk_start_step = train_one_chunk(
-                    model=model, cds=cds, chunk_id=chunk_info['id'],
-                    optimizers=optimizers, scheduler=scheduler,
-                    checkpoint_manager=ckpt_mgr, training_history=training_history,
-                    global_step=global_step, total_training_time=total_training_time,
-                    current_epoch=epoch, chunk_within_epoch=cwi,
-                    chunk_start_step=chunk_start_step,
-                    prefetcher=prefetcher, next_chunk_info=next_chunk_info,
+                    model               = model,
+                    chunk_info          = chunk_info,
+                    optimizers          = optimizers,
+                    scheduler           = scheduler,
+                    checkpoint_manager  = ckpt_mgr,
+                    training_history    = training_history,
+                    global_step         = global_step,
+                    total_training_time = total_training_time,
+                    current_epoch       = epoch,
+                    chunk_within_epoch  = cwi,
+                    chunk_start_step    = chunk_start_step,
                 )
                 cp = None
 
             except KeyboardInterrupt:
                 print('\nCTRL+C — sauvegarde...')
                 ckpt_mgr.save(model, optimizers, scheduler, metadata={
-                    'current_epoch': epoch, 'chunk_within_epoch': cwi,
-                    'global_step': global_step, 'chunk_start_step': chunk_start_step,
+                    'current_epoch':       epoch,
+                    'chunk_within_epoch':  cwi,
+                    'global_step':         global_step,
+                    'chunk_start_step':    chunk_start_step,
                     'total_training_time': total_training_time,
-                    'training_history': training_history,
+                    'training_history':    training_history,
                 })
-                prefetcher.cancel()
                 return
 
             except Exception:
-                print(f'\nERREUR :\n{traceback.format_exc()}')
+                print(f'\nERREUR chunk_{chunk_info["id"]:03d} :\n{traceback.format_exc()}')
                 ckpt_mgr.save(model, optimizers, scheduler, metadata={
-                    'current_epoch': epoch, 'chunk_within_epoch': cwi,
-                    'global_step': global_step, 'chunk_start_step': chunk_start_step,
+                    'current_epoch':       epoch,
+                    'chunk_within_epoch':  cwi,
+                    'global_step':         global_step,
+                    'chunk_start_step':    chunk_start_step,
                     'total_training_time': total_training_time,
-                    'training_history': training_history,
+                    'training_history':    training_history,
                 })
-                prefetcher.cancel()
                 raise
 
-            # Save 25%
             next_cwi = cwi + 1
             save_ep  = epoch + 1 if next_cwi >= CONFIG['chunks_per_epoch'] else epoch
             save_cwi = 0         if next_cwi >= CONFIG['chunks_per_epoch'] else next_cwi
             pct      = int(next_cwi / CONFIG['chunks_per_epoch'] * 100)
-            print(f'\n  [{pct}% epoch {epoch}] Save...')
+            print(f'\n  [{pct}% epoch {epoch}] Save 25%...')
             ckpt_mgr.save(model, optimizers, scheduler, metadata={
-                'current_epoch': save_ep, 'chunk_within_epoch': save_cwi,
-                'global_step': global_step, 'chunk_start_step': global_step,
+                'current_epoch':       save_ep,
+                'chunk_within_epoch':  save_cwi,
+                'global_step':         global_step,
+                'chunk_start_step':    global_step,
                 'total_training_time': total_training_time,
-                'training_history': training_history,
+                'training_history':    training_history,
             })
-
-            # Swap chunk : unload courant, récupérer prefetché
-            cds.unload()
-            del cds
-
-            if next_chunk_info is not None:
-                print(f"  ⏳ Récupération prefetch chunk_{next_chunk_info['id']:03d}...")
-                cds = prefetcher.get()
-                if cds is None:
-                    # Fallback si prefetch a échoué
-                    next_val_seed = CONFIG['shuffle_seed'] + (epoch - 1) * 1000 + (cwi + 1)
-                    cds = VRAMChunkLoader(next_chunk_info, CONFIG['max_seq_len'],
-                                         tokenizer.pad_token_id, CONFIG['val_tokens'],
-                                         val_seed=next_val_seed)
 
         ep_hist  = [c for c in training_history['chunks'] if c['current_epoch'] == epoch]
         avg_loss = sum(c['train_loss'] for c in ep_hist) / max(len(ep_hist), 1)
+
         print(f'\n{"="*80}')
         print(f'EPOCH {epoch} TERMINÉE  loss={avg_loss:.4f}  '
               f'step={global_step:,}  time={total_training_time/3600:.2f}h')
         print(f'{"="*80}')
+
         training_history['epochs'].append({
             'epoch': epoch, 'train_loss': avg_loss,
             'global_step': global_step, 'time_sec': total_training_time,
@@ -949,11 +1002,15 @@ def main():
     if training_history.get('validations'):
         last = training_history['validations'][-1]
         print(f'  Val PPL : {last["val_ppl"]:.2f}  Val Loss : {last["val_loss"]:.4f}')
+    print(f'  Checkpoint : {ckpt_mgr.path}')
 
     ckpt_mgr.save(model, optimizers, scheduler, metadata={
-        'current_epoch': CONFIG['num_epochs'] + 1, 'chunk_within_epoch': 0,
-        'global_step': global_step, 'chunk_start_step': global_step,
-        'total_training_time': total_training_time, 'training_history': training_history,
+        'current_epoch':       CONFIG['num_epochs'] + 1,
+        'chunk_within_epoch':  0,
+        'global_step':         global_step,
+        'chunk_start_step':    global_step,
+        'total_training_time': total_training_time,
+        'training_history':    training_history,
     })
     history_path = CONFIG['checkpoint_file'].replace('.pt', '_history.json')
     with open(history_path, 'w') as f:
