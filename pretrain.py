@@ -1,3 +1,4 @@
+
 #!/usr/bin/env python3
 """
 HessGPT Pre-Training v5 — LLaMA-3 Tokenizer
@@ -13,6 +14,7 @@ FIXES v5 :
   ✅ soft_cap warning explicite (feature non implémentée dans forward)
   ✅ SeededSampler sans copie inutile
   ✅ num_workers calibré H100 SXM (8 suffit, 16 = contention)
+  ✅ torch.compile cache disque → ./CompileCache (évite recompile multi-compte)
 
 OBJECTIF PERF H100 SXM :
   Avant : ~4 it/s
@@ -20,10 +22,18 @@ OBJECTIF PERF H100 SXM :
   (batch=24, accum=4, seq=1024, bfloat16, Flash Attention)
 """
 
+import os
+
+# ============================================================
+# COMPILE CACHE — doit être set AVANT tout import torch
+# ============================================================
+os.environ["TORCHINDUCTOR_CACHE_DIR"]    = "./CompileCache"
+os.environ["TORCHINDUCTOR_FX_GRAPH_CACHE"] = "1"
+os.makedirs("./CompileCache", exist_ok=True)
+
 import torch
 from torch.utils.data import DataLoader, Dataset
 import sys
-import os
 import time
 import math
 import json
@@ -47,6 +57,7 @@ SPECIAL_TOKENS = ['<code>', '<think>', '</think>']
 print("=" * 80)
 print("HessGPT v5 — LLaMA-3 | RMSNorm | Flash | QK-Norm | WSD | Muon+MARS-M")
 print("=" * 80)
+print(f"  CompileCache → ./CompileCache")
 
 # ============================================================
 # CONFIGURATION
@@ -70,7 +81,7 @@ CONFIG = {
     'use_flash_attn':        True,
 
     # ── Training
-    'batch_size':            90,
+    'batch_size':            80,
     'gradient_accumulation': 8,
     'max_grad_norm':         1.0,
     'learning_rate':         4e-4,
@@ -343,8 +354,6 @@ class LazyChunkDataset:
         for fname in chunk_info['files']:
             fpath = os.path.join(chunk_info['dir'], fname)
             try:
-                # mmap_mode='r' évite une copie temporaire supplémentaire au chargement.
-                # np.array() force quand même la copie en RAM (nécessaire pour le shuffle).
                 arr = np.load(fpath, mmap_mode='r')
                 arrays.append(torch.from_numpy(np.array(arr, dtype=np.int32)).long())
             except Exception as e:
@@ -565,16 +574,12 @@ class Muon(torch.optim.Optimizer):
                     prev_g     = state['prev_grad']
                     norm_g     = g.norm() + 1e-8
                     norm_prev  = prev_g.norm() + 1e-8
-                    # Coefficient de correction MARS (scalaire tensor)
                     c_t = (mars_gamma / (1.0 - mars_gamma)) * (norm_g / norm_prev)
-                    # Clamp en tensor pour éviter sync CUDA (.item() bloquant)
                     c_t = torch.clamp(c_t, max=1.0)
-                    # Gradient corrigé : amplifie la direction de changement
                     g = g + c_t * (g - prev_g)
-                    # Sauvegarder le grad original (avant correction) pour le step suivant
                     state['prev_grad'].copy_(p.grad)
                 else:
-                    pass  # use_mars=False : g utilisé tel quel
+                    pass
 
                 # ── Momentum buffer ───────────────────────────────
                 if 'momentum_buffer' not in state:
@@ -626,7 +631,6 @@ def configure_optimizers(model, lr, weight_decay, betas, eps):
             muon_params.append(p)
         elif p.dim() < 2 and pn.startswith('blocks.'):
             # ✅ FIX : RMSNorm weights (dim=1) dans blocks → AdamW nodecay
-            # Avant : jamais mis à jour (ni Muon ni AdamW) → bug silencieux
             adamw_nodecay.append(p)
         elif p.dim() >= 2:
             adamw_decay.append(p)
@@ -645,7 +649,6 @@ def configure_optimizers(model, lr, weight_decay, betas, eps):
         use_mars     = True,
         mars_gamma   = 0.025,
     )
-    # ✅ FIX : tag is_muon sur le param_group pour WSD scheduler
     muon_opt.param_groups[0]['is_muon'] = True
 
     adamw_opt = torch.optim.AdamW(
@@ -687,11 +690,8 @@ def train_one_chunk(
     steps_done   = global_step - chunk_start_step
     batches_done = steps_done * CONFIG['gradient_accumulation']
 
-    # ✅ shuffle_seed cohérent multi-account : base + epoch*1000 + cwi
-    # Si reprise à epoch=2 cwi=1 → seed = 42 + 2000 + 1 = 2043 (différent de epoch=1 cwi=1)
     shuffle_seed = CONFIG['shuffle_seed'] + (current_epoch - 1) * 1000 + chunk_within_epoch
-    # ✅ val_seed variable pour éviter le même split val à chaque chunk
-    val_seed = shuffle_seed
+    val_seed     = shuffle_seed
 
     print(f"\n{'='*80}")
     print(f"  {label}  LR_adamw={scheduler.get_last_lr()[0]:.2e}"
@@ -728,16 +728,14 @@ def train_one_chunk(
         skip_samples = skip_samples,
     )
 
-    # ✅ FIX bottleneck #1 : persistent_workers=True — workers ne meurent plus entre batches
-    # Sur H100 SXM : passe de ~4 it/s à ~18-25 it/s
     train_loader = DataLoader(
         train_ds,
         batch_size         = CONFIG['batch_size'],
         sampler            = sampler,
         num_workers        = CONFIG['num_workers'],
         pin_memory         = True,
-        persistent_workers = True,   # ✅ FIX CRITIQUE
-        prefetch_factor    = 2,      # ✅ pipeline data pendant compute
+        persistent_workers = True,
+        prefetch_factor    = 2,
         drop_last          = True,
     )
     val_loader = DataLoader(
@@ -769,11 +767,6 @@ def train_one_chunk(
     for batch_idx, (x, y) in enumerate(pbar):
         try:
             x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
-
-            # ✅ FIX bottleneck #5 : mark_step_begin() RETIRÉ
-            # Sur H100 avec torch.compile, ça forçait une sync CPU↔GPU à chaque batch
-            # → tuait le pipeline async GPU
-            # À n'utiliser que si tu gères les CUDA graphs manuellement
 
             with torch.amp.autocast(device, dtype=adt, enabled=ae):
                 _, loss, _ = model(x, targets=y, pad_token_id=tokenizer.pad_token_id)
@@ -857,7 +850,6 @@ def train_one_chunk(
 
     pbar.close()
 
-    # ✅ Fermer les workers persistent proprement avant unload du chunk
     train_loader._iterator = None
     del train_loader
 
@@ -877,7 +869,6 @@ def train_one_chunk(
         'global_step':        global_step,
     })
 
-    # Fermer les workers persistent proprement avant unload du chunk
     val_loader._iterator = None
     del val_loader
     cds.unload()
@@ -922,6 +913,20 @@ def main():
 
     if CONFIG['use_compile'] and device == 'cuda':
         print('torch.compile...')
+        # ── Cache déjà activé via env vars au top du fichier ──
+        # ./CompileCache — premier lancement : 30-60min
+        # Lancements suivants (même GPU, même archi) : ~10-30s
+        import torch._dynamo
+        torch._dynamo.config.cache_size_limit = 256
+        torch._dynamo.config.suppress_errors  = True
+        cache_size = sum(
+            os.path.getsize(os.path.join(dp, f))
+            for dp, _, files in os.walk('./CompileCache')
+            for f in files
+        ) if os.path.exists('./CompileCache') else 0
+        cache_empty = cache_size < 1024
+        print(f"  Cache : ./CompileCache  "
+              f"({'vide — première compile' if cache_empty else f'{cache_size/1e6:.0f}MB — cache hit probable'})")
         try:
             model = torch.compile(model, mode=CONFIG['compile_mode'])
             print('  OK')
@@ -978,7 +983,6 @@ def main():
 
         scheduler.load_state_dict(cp['scheduler_state_dict'])
 
-        # ✅ LR sync avec tag is_muon
         for pg in muon_opt.param_groups:
             pg['lr'] = scheduler.get_lr() * 5.0
         for pg in adamw_opt.param_groups:
