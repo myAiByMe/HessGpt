@@ -191,6 +191,9 @@ class HessGPT(nn.Module):
 
         # ── Embeddings ───────────────────────────────────────────
         token_embeds = self.token_embeddings(input_ids)
+        # FA2/FA3/FA4 refusent float32 — cast en bf16 si GPU
+        if token_embeds.device.type == 'cuda' and token_embeds.dtype == torch.float32:
+            token_embeds = token_embeds.to(torch.bfloat16)
 
         if self.use_rope:
             x = self.dropout(token_embeds)
