@@ -50,7 +50,7 @@ CONFIG = {
     'use_qk_norm':           True,
     'soft_cap':              None,
     'use_flash_attn':        True,
-    'batch_size':            200,
+    'batch_size':            130,
     'gradient_accumulation': 1,
     'max_grad_norm':         1.0,
     'learning_rate':         4e-4,
