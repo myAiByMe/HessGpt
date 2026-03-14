@@ -50,7 +50,7 @@ CONFIG = {
     'use_qk_norm':           True,
     'soft_cap':              None,
     'use_flash_attn':        True,
-    'batch_size':            100,
+    'batch_size':            200,
     'gradient_accumulation': 1,
     'max_grad_norm':         1.0,
     'learning_rate':         4e-4,
@@ -59,7 +59,7 @@ CONFIG = {
     'adam_beta2':            0.95,
     'adam_eps':              1e-8,
     'num_epochs':       5,
-    'chunks_per_epoch': 3,
+    'chunks_per_epoch': 1,
     'data_dir':   './data/ultra_filtered',
     'val_tokens': 15_000_000,
     'warmup_ratio': 0.03,
@@ -72,7 +72,7 @@ CONFIG = {
     'checkpoint_file': './Model/HessGpt_pretrain.pt',
     'use_compile':  True,
     'compile_mode': 'default',
-    'num_workers':  8,
+    'num_workers':  1,
 }
 
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
